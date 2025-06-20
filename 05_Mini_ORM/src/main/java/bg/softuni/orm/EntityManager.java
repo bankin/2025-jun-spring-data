@@ -11,11 +11,20 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 public class EntityManager<E> implements DbContext<E> {
+    private static final String INSERT_QUERY = "INSERT INTO %s (%s) VALUES (%s)";
+    private static final String SELECT_QUERY_WITH_WHERE_LIMIT = "SELECT * FROM %s %s %s";
+    // UPDATE %s SET field=value, field=value WHERE idColumn = idValue;
+    private static final String UPDATE_QUERY = "UPDATE %s SET %s WHERE %s = %s";
+
     private final Connection connection;
 
     public EntityManager(Connection connection) {
@@ -32,23 +41,54 @@ public class EntityManager<E> implements DbContext<E> {
             return doInsert(entity);
         }
 
-        return false;
-//        return doUpdate(entity);
+        return doUpdate(entity);
     }
 
-    private boolean doInsert(E entity) throws SQLException {
-        String insertTemplate = "INSERT INTO %s (%s) VALUES (%s)";
-
+    private boolean doUpdate(E entity) throws IllegalAccessException, SQLException {
         String tableName = getTableName(entity.getClass());
-        String columnNames = getColumnNamesWithoutId(entity);
-        String values = getValuesWithoutId(entity);
+        Field idColumn = getIdField(entity);
+        int idValue = getIdFieldValue(entity, idColumn);
+        String fieldListWithValues = getFieldsWithValues(entity);
 
-        String sql = String.format(insertTemplate, tableName, columnNames, values);
+        String sql = String.format(UPDATE_QUERY, tableName, fieldListWithValues, idColumn.getName(), idValue);
 
         return this.connection.prepareStatement(sql).executeUpdate() > 0;
     }
 
-    private String getValuesWithoutId(E entity) { // orderId - 5, amount - 20, createdAt - 2025-02-04..
+    private String getFieldsWithValues(E entity) {
+        List<String> columnNames = getColumnNamesWithoutId(entity);
+        List<String> values = getValuesWithoutId(entity);
+
+        // .boxed = IntStream -> Stream<Integer>
+        // .mapToInt = Stream<Integer> -> IntStream
+
+//        return IntStream.range(0, columnNames.size())
+//            .boxed()
+//            .map(i -> columnNames.get(i) + "=" + values.get(i))
+//            .collect(Collectors.joining(","));
+
+        List<String> result = new ArrayList<>();
+        for (int i = 0; i < columnNames.size(); i++) {
+            result.add(columnNames.get(i) + "=" + values.get(i));
+        }
+
+        return String.join(",", result);
+    }
+
+    private boolean doInsert(E entity) throws SQLException {
+        String tableName = getTableName(entity.getClass());
+        List<String> columnNames = getColumnNamesWithoutId(entity);
+        List<String> values = getValuesWithoutId(entity);
+
+        String sqlValues = String.join(",", values);
+        String sqlColumns = String.join(",", columnNames);
+
+        String sql = String.format(INSERT_QUERY, tableName, sqlColumns, sqlValues);
+
+        return this.connection.prepareStatement(sql).executeUpdate() > 0;
+    }
+
+    private List<String> getValuesWithoutId(E entity) { // orderId - 5, amount - 20, createdAt - 2025-02-04..
         return Arrays.stream(entity
             .getClass()
             .getDeclaredFields())
@@ -64,18 +104,18 @@ public class EntityManager<E> implements DbContext<E> {
                 })
                 .map(Object::toString) // ["20", "2025-02-04.."]
                 .map(s -> "'" + s + "'")
-                .collect(Collectors.joining(",")); // "20", "2025-02-04.."
+                .toList(); // ["'20'", "'2025-02-04..'"]
     }
 
     // TODO: Add default if name in @Column is missing
-    private String getColumnNamesWithoutId(E entity) { // orderId, amount, createdAt
+    private List<String> getColumnNamesWithoutId(E entity) { // orderId, amount, createdAt
         return Arrays.stream(entity
             .getClass()
             .getDeclaredFields())
                 .filter(field -> field.isAnnotationPresent(Column.class)) // [orderId, amount, createdAt]
                 .filter(field -> !field.isAnnotationPresent(Id.class)) // [amount, createdAt]
                 .map(field -> field.getAnnotation(Column.class).name()) // [amount, created_at]
-                .collect(Collectors.joining(",")); // amount, created_at
+                .toList(); // [amount, created_at]
     }
 
     private String getTableName(Class<?> clazz) {
@@ -111,13 +151,13 @@ public class EntityManager<E> implements DbContext<E> {
     }
 
     @Override
-    public Iterable<E> find(Class<E> clazz) {
+    public Iterable<E> find(Class<E> clazz) throws SQLException, InvocationTargetException, NoSuchMethodException, InstantiationException, IllegalAccessException {
         return find(clazz, null);
     }
 
     @Override
-    public Iterable<E> find(Class<E> clazz, String where) {
-        return null;
+    public Iterable<E> find(Class<E> clazz, String where) throws SQLException, InvocationTargetException, NoSuchMethodException, InstantiationException, IllegalAccessException {
+        return baseFind(clazz, where, null);
     }
 
     @Override
@@ -127,22 +167,35 @@ public class EntityManager<E> implements DbContext<E> {
 
     @Override
     public E findFirst(Class<E> clazz, String where) throws SQLException, InvocationTargetException, NoSuchMethodException, InstantiationException, IllegalAccessException {
-        String selectQuery = "SELECT * FROM %s %s LIMIT 1";
-        String tableName = getTableName(clazz);
+        Iterable<E> items = baseFind(clazz, where, 1);
 
-        String computedWhere = where == null ? "" : "WHERE " + where;
-
-        String sql = String.format(selectQuery, tableName, computedWhere);
-
-        ResultSet result = connection.prepareStatement(sql).executeQuery();
-
-        boolean hasElement = result.next();
-
-        if (!hasElement) {
+        Iterator<E> iterator = items.iterator();
+        if (!iterator.hasNext()) {
             return null;
         }
 
-         return fillEntity(result, clazz);
+        return iterator.next();
+    }
+
+    private Iterable<E> baseFind(Class<E> clazz, String where, Integer limit) throws SQLException, InvocationTargetException, NoSuchMethodException, InstantiationException, IllegalAccessException {
+        String tableName = getTableName(clazz);
+
+        String computedWhere = where == null ? "" : "WHERE " + where;
+        String computedLimit = limit == null ? "" : "LIMIT " + limit;
+
+        String sql = String.format(SELECT_QUERY_WITH_WHERE_LIMIT, tableName, computedWhere, computedLimit);
+
+        ResultSet result = connection.prepareStatement(sql).executeQuery();
+
+        List<E> iterable = new ArrayList<>();
+
+        while (result.next()) {
+            E nextItem = fillEntity(result, clazz);
+
+            iterable.add(nextItem);
+        }
+
+        return iterable;
     }
 
     private E fillEntity(ResultSet result, Class<E> clazz) throws NoSuchMethodException, InvocationTargetException, InstantiationException, IllegalAccessException {
